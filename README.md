@@ -15,6 +15,54 @@ pip install -e .            # or: pip install -e '.[test]' to get pytest
 
 Requires Python 3.9+, `requests` and `dnspython`.
 
+## Full scan (start here)
+
+```bash
+reconkit scan example.com                         # passive enumeration + audit every live host
+reconkit scan example.com --brute -o report.json  # add wordlist guessing, save full JSON
+reconkit scan example.com --limit 20 --http-threads 20 --no-cors
+```
+
+`scan` chains everything: it enumerates subdomains, keeps the ones that
+resolve, then for each host checks for a **dangling CNAME** (possible subdomain
+takeover) and grades its **security headers**, including the HTTP-to-HTTPS
+redirect. Output is one table sorted worst-first, with takeover leads listed
+separately:
+
+```
+HOST               HTTP  GRADE  HIGH MED LOW  TOP ISSUE
+old.example.com    -     -                    no address (CNAME target does not resolve)
+www.example.com    200   C         1   0   3  script-src allows 'unsafe-inline'
+api.example.com    200   B         0   1   2  HSTS missing
+
+Possible subdomain takeovers (1) - verify manually:
+  LIKELY old.example.com -> old-site.herokuapp.com  [Heroku]
+         CNAME target old-site.herokuapp.com does not resolve (NXDOMAIN)
+```
+
+It accepts all of the enumeration options below (`--brute`, `-w`, `--sources`,
+`--no-passive`, `-n`, `-t`).
+
+### Subdomain takeover detection
+
+A takeover is possible when `shop.example.com` is a CNAME to a hosted service
+(`old.myshopify.com`, `acme.github.io`, an S3 bucket ...) but the resource on
+that service was deleted: whoever claims the same name on the service then
+controls content on `shop.example.com`. reconkit flags a host when:
+
+- the CNAME chain ends in **NXDOMAIN** (the alias points at nothing). The
+  resolver asks for the CNAME record directly in this case, because a normal
+  lookup just reports "does not exist" and hides the alias; or
+- the service answers with its **"nothing configured here" page**, matched
+  against fingerprints for about 15 common providers (GitHub Pages, Heroku, S3,
+  Azure, Shopify, Fastly, Netlify, ...) in `reconkit/takeover.py`.
+
+`LIKELY` means a known provider matched; `POSSIBLE` means the target is gone but
+the provider isn't recognised. Both are leads only: reconkit never tries to claim
+anything. Confirm manually, and check
+[can-i-take-over-xyz](https://github.com/EdOverflow/can-i-take-over-xyz) for
+which providers are currently exploitable, since error pages change.
+
 ## Subdomain enumeration
 
 ```bash
@@ -54,6 +102,8 @@ reconkit headers example.com -v        # include info-level notes and raw values
 reconkit headers example.com --json
 ```
 
+Every command also takes `-o FILE` to save the full results as JSON.
+
 Each finding has a severity, a **why**, and a **fix**. The checks:
 
 - **Strict-Transport-Security**: missing, `max-age` too short/zero, no `includeSubDomains`/`preload`; site not on HTTPS at all
@@ -66,6 +116,7 @@ Each finding has a severity, a **why**, and a **fix**. The checks:
 - **Information disclosure**: versioned `Server`, `X-Powered-By`, `X-AspNet-Version`, …
 - **Cookies**: missing `Secure`, `HttpOnly`, `SameSite`; `SameSite=None` without `Secure`
 - **CORS**: sends a request with a foreign `Origin` and flags reflection (high if combined with `Allow-Credentials: true`), `null` origin, or `*` (skip with `--no-cors`)
+- **HTTP to HTTPS redirect**: requests `http://host/` and follows redirects by hand. It flags no redirect, a chain that never reaches HTTPS, extra plain-HTTP hops, and a first hop to a *different* host (the browser then never learns this host's HSTS policy). Skip with `--no-redirect`
 
 The score starts at 100 and subtracts 25 / 12 / 5 for high / medium / low
 findings, giving a grade from A to F. If the response is HTTP 4xx/5xx the output
@@ -83,8 +134,10 @@ Tests are offline: HTTP sessions and DNS resolvers are faked.
 ```
 reconkit/
   cli.py          argparse front end, text + JSON output
-  subdomains.py   passive sources, DNS resolver, wildcard detection, brute force
-  headers.py      one check_* function per header, scoring
+  scan.py         enumerate -> audit every live host, worst-first
+  subdomains.py   passive sources, DNS resolver, wildcard + dangling-CNAME detection, brute force
+  headers.py      one check_* function per header, redirect check, scoring
+  takeover.py     provider fingerprints for dangling-CNAME detection
   http.py         shared session, URL normalisation, raw Set-Cookie access
   data/subdomains.txt
 tests/
@@ -92,5 +145,5 @@ tests/
 
 Ideas for extending: more passive sources (e.g. SecurityTrails, VirusTotal with
 API keys), recursive brute-forcing of discovered subdomains, permutation
-generation (`dev-api`, `api2`), and checking CNAMEs against known
-takeover-prone services.
+generation (`dev-api`, `api2`), TLS certificate checks, and a scope file that
+refuses out-of-scope targets.

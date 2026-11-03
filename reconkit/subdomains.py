@@ -43,6 +43,9 @@ class Resolution:
     name: str
     addresses: list[str] = field(default_factory=list)
     cnames: list[str] = field(default_factory=list)
+    # True when the name has a CNAME but the chain ends in NXDOMAIN: the alias
+    # points at something that no longer exists (a subdomain-takeover signal).
+    dangling: bool = False
 
     @property
     def alive(self) -> bool:
@@ -69,6 +72,7 @@ class SubdomainResult:
                 "sources": sorted(self.found[name]),
                 "addresses": r.addresses if r else None,
                 "cnames": r.cnames if r else None,
+                "dangling": r.dangling if r else None,
             })
         return {
             "domain": self.domain,
@@ -182,8 +186,14 @@ class Resolver:
         for rtype in ("A", "AAAA"):
             try:
                 answer = self._r.resolve(name, rtype)
-            except (dns.resolver.NXDOMAIN, dns.resolver.NoNameservers):
-                return res  # name does not exist; no point asking for AAAA
+            except dns.resolver.NXDOMAIN:
+                # Either the name doesn't exist, or it's a CNAME whose target
+                # doesn't. Ask for the CNAME itself (servers answer that without
+                # following the chain) to tell the two apart.
+                self._check_dangling(name, res)
+                return res
+            except dns.resolver.NoNameservers:
+                return res
             except (dns.resolver.NoAnswer, dns.exception.Timeout):
                 continue
             for rrset in answer.response.answer:
@@ -196,6 +206,15 @@ class Resolver:
                         res.addresses.append(rdata.address)
         res.addresses = sorted(set(res.addresses))
         return res
+
+    def _check_dangling(self, name: str, res: Resolution) -> None:
+        try:
+            answer = self._r.resolve(name, "CNAME")
+        except dns.exception.DNSException:
+            return
+        for rdata in answer:
+            res.cnames.append(rdata.target.to_text().rstrip("."))
+        res.dangling = bool(res.cnames)
 
 
 def detect_wildcard(domain: str, resolver: Resolver, probes: int = 3) -> set[str]:

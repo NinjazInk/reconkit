@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import asdict, dataclass
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import requests
 
@@ -302,6 +302,58 @@ def check_cors(url: str, session: requests.Session, timeout: int) -> list[Findin
     return []
 
 
+def check_https_redirect(url: str, session: requests.Session, timeout: int,
+                         max_hops: int = 5) -> list[Finding]:
+    """Request the http:// version of the host and follow redirects by hand.
+
+    HSTS only protects visits *after* the browser has seen it, so the plain-HTTP
+    entry point must send users straight to HTTPS on the same host (that first
+    HTTPS response is where the browser learns the HSTS policy).
+    """
+    parsed = urlparse(url)
+    host = parsed.hostname
+    if not host:
+        return []
+    current = f"http://{parsed.netloc}/"
+    hops: list[str] = []
+    for _ in range(max_hops):
+        try:
+            r = session.get(current, timeout=timeout, allow_redirects=False)
+        except requests.RequestException:
+            return []  # port 80 closed or filtered: nothing served in plaintext
+        location = r.headers.get("Location")
+        if not (300 <= r.status_code < 400 and location):
+            break
+        nxt = urljoin(current, location)
+        hops.append(nxt)
+        if urlparse(nxt).scheme == "https":
+            break
+        current = nxt
+
+    chain = " -> ".join([f"http://{parsed.netloc}/"] + hops)
+    if not hops:
+        return [Finding("Redirect", "medium", "HTTP does not redirect to HTTPS",
+                        "The site answers over plain HTTP without redirecting, so users who type the "
+                        "bare domain or follow an old http:// link stay on an unencrypted connection.",
+                        "Return a 301 from http:// to the same URL on https://.", chain)]
+    final = urlparse(hops[-1])
+    if final.scheme != "https":
+        return [Finding("Redirect", "medium", "HTTP redirect never reaches HTTPS",
+                        f"After {len(hops)} redirect(s) the browser is still on plain HTTP.",
+                        "Redirect http:// directly to https://.", chain)]
+    if len(hops) > 1:
+        return [Finding("Redirect", "low", "HTTP reaches HTTPS only via extra plain-HTTP hops",
+                        "Every hop over plain HTTP is a chance for an attacker on the network to "
+                        "rewrite the redirect and keep the user on HTTP.",
+                        "Make the first response a redirect to https://.", chain)]
+    if final.hostname != host:
+        return [Finding("Redirect", "low", "First redirect goes to HTTPS on a different host",
+                        f"http://{host} jumps straight to {final.hostname}, so the browser never sees "
+                        f"an HTTPS response from {host} and can't learn its HSTS policy.",
+                        f"Redirect to https://{host}/ first, then on to {final.hostname}.", chain)]
+    return []
+
+
 # --------------------------------------------------------------------------- #
 
 def analyze_response(resp: requests.Response, url: str) -> list[Finding]:
@@ -321,13 +373,15 @@ def analyze_response(resp: requests.Response, url: str) -> list[Finding]:
 
 
 def analyze(url: str, *, session: requests.Session | None = None, timeout: int = DEFAULT_TIMEOUT,
-            cors: bool = True) -> HeaderReport:
+            cors: bool = True, redirect: bool = True) -> HeaderReport:
     url = normalize_url(url)
     session = session or make_session()
     resp = session.get(url, timeout=timeout, allow_redirects=True)
     findings = analyze_response(resp, url)
     if cors:
         findings += check_cors(resp.url, session, timeout)
+    if redirect and urlparse(resp.url).scheme == "https":
+        findings += check_https_redirect(resp.url, session, timeout)
     findings.sort(key=lambda f: SEVERITY_ORDER.index(f.severity))
     score = max(0, 100 - sum(SEVERITY_WEIGHT[f.severity] for f in findings))
     return HeaderReport(url=url, final_url=resp.url, status=resp.status_code,

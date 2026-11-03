@@ -10,6 +10,7 @@ import requests
 
 from . import __version__
 from .headers import analyze
+from .scan import scan
 from .subdomains import PASSIVE_SOURCES, enumerate_subdomains
 
 COLORS = {"high": "31", "medium": "33", "low": "36", "info": "37", "ok": "32", "dim": "90"}
@@ -27,31 +28,49 @@ def log(msg: str) -> None:
     print(msg, file=sys.stderr)
 
 
-# --------------------------------------------------------------------------- #
+def save_output(args, data: dict) -> None:
+    """Write JSON to -o FILE if given (in addition to normal output)."""
+    if getattr(args, "output", None):
+        with open(args.output, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+        log(f"saved JSON report to {args.output}")
 
-def cmd_subdomains(args) -> int:
+
+def check_sources(args) -> list[str] | None:
     sources = args.sources.split(",") if args.sources else None
     if sources:
         bad = [s for s in sources if s not in PASSIVE_SOURCES]
         if bad:
-            log(f"unknown source(s): {', '.join(bad)}. choices: {', '.join(PASSIVE_SOURCES)}")
-            return 2
+            raise ValueError(f"unknown source(s): {', '.join(bad)}. choices: {', '.join(PASSIVE_SOURCES)}")
+    return sources
+
+
+def enum_kwargs(args) -> dict:
+    return dict(
+        passive=not args.no_passive,
+        sources=check_sources(args),
+        bruteforce=args.brute,
+        wordlist=args.wordlist,
+        threads=args.threads,
+        nameservers=args.nameserver or None,
+    )
+
+
+# --------------------------------------------------------------------------- #
+
+def cmd_subdomains(args) -> int:
     try:
         result = enumerate_subdomains(
             args.domain,
-            passive=not args.no_passive,
-            sources=sources,
-            bruteforce=args.brute,
-            wordlist=args.wordlist,
             resolve=not args.no_resolve,
-            threads=args.threads,
-            nameservers=args.nameserver or None,
             log=log if not args.quiet else (lambda _m: None),
+            **enum_kwargs(args),
         )
     except ValueError as exc:
         log(str(exc))
         return 2
 
+    save_output(args, result.to_dict())
     if args.json:
         print(json.dumps(result.to_dict(), indent=2))
         return 0
@@ -68,7 +87,9 @@ def cmd_subdomains(args) -> int:
             detail += " -> " + ", ".join(r["cnames"])
         if r["addresses"]:
             detail += "  [" + ", ".join(r["addresses"]) + "]"
-        if resolved and not alive:
+        if r.get("dangling"):
+            detail += "  " + c("(CNAME target does not resolve: possible takeover)", "high", color)
+        elif resolved and not alive:
             detail += "  (no DNS record)"
         name = c(r["name"], "ok" if alive else "dim", color)
         src = c(f"({', '.join(r['sources'])})", "dim", color)
@@ -80,11 +101,13 @@ def cmd_subdomains(args) -> int:
 
 def cmd_headers(args) -> int:
     try:
-        report = analyze(args.url, timeout=args.timeout, cors=not args.no_cors)
+        report = analyze(args.url, timeout=args.timeout, cors=not args.no_cors,
+                         redirect=not args.no_redirect)
     except requests.RequestException as exc:
         log(f"request failed: {exc}")
         return 1
 
+    save_output(args, report.to_dict())
     if args.json:
         print(json.dumps(report.to_dict(), indent=2))
         return 0
@@ -115,13 +138,85 @@ def cmd_headers(args) -> int:
     return 0
 
 
+def cmd_scan(args) -> int:
+    try:
+        result = scan(
+            args.domain,
+            http_threads=args.http_threads,
+            timeout=args.timeout,
+            cors=not args.no_cors,
+            check_takeover=not args.no_takeover,
+            limit=args.limit,
+            log=log if not args.quiet else (lambda _m: None),
+            **enum_kwargs(args),
+        )
+    except ValueError as exc:
+        log(str(exc))
+        return 2
+
+    save_output(args, result.to_dict())
+    if args.json:
+        print(json.dumps(result.to_dict(), indent=2))
+        return 0
+
+    color = _use_color(sys.stdout)
+    hosts = result.hosts
+    if not hosts:
+        print("No live hosts found.")
+        return 0
+
+    width = max(len(h.name) for h in hosts)
+    print(f"\n{'HOST':<{width}}  HTTP  GRADE  HIGH MED LOW  TOP ISSUE")
+    for h in hosts:
+        if h.report:
+            k = h.counts()
+            grade = h.report.grade
+            gcol = "ok" if grade in "AB" else "medium" if grade == "C" else "high"
+            top = next((f.title for f in h.report.findings if f.severity in ("high", "medium")), "")
+            status = str(h.report.status)
+            cols = f"{status:<4}  {c(grade, gcol, color)}{' ' * 4}  {k['high']:>4} {k['medium']:>3} {k['low']:>3}  {top}"
+        else:
+            cols = c(f"{'-':<4}  {'-':<5}  {'':>4} {'':>3} {'':>3}  {h.error or ''}", "dim", color)
+        print(f"{h.name:<{width}}  {cols}")
+
+    if result.takeovers:
+        print(c(f"\nPossible subdomain takeovers ({len(result.takeovers)}) - verify manually:", "high", color))
+        for t in result.takeovers:
+            svc = t.service or "unknown service"
+            print(f"  {c(t.confidence.upper(), 'high', color)} {t.name} -> {' -> '.join(t.cnames)}  [{svc}]")
+            for e in t.evidence:
+                print(f"         {e}")
+    graded = [h for h in hosts if h.report]
+    weak = sum(1 for h in graded if h.report.grade in "DF")
+    log(f"\n{len(hosts)} live hosts, {len(graded)} answered HTTP(S), {weak} graded D or F, "
+        f"{len(result.takeovers)} possible takeovers")
+    return 0
+
+
 # --------------------------------------------------------------------------- #
+
+def add_enum_options(s: argparse.ArgumentParser) -> None:
+    s.add_argument("--brute", action="store_true", help="also guess names from a wordlist via DNS")
+    s.add_argument("-w", "--wordlist", help="wordlist for --brute (default: built-in list)")
+    s.add_argument("--sources", help=f"comma-separated passive sources ({','.join(PASSIVE_SOURCES)})")
+    s.add_argument("--no-passive", action="store_true", help="skip third-party lookups")
+    s.add_argument("-t", "--threads", type=int, default=50,
+                   help="parallel DNS lookups (default: %(default)s)")
+    s.add_argument("-n", "--nameserver", action="append", help="DNS server to use (repeatable)")
+    s.add_argument("-q", "--quiet", action="store_true", help="no progress messages")
+
+
+def add_output_options(s: argparse.ArgumentParser) -> None:
+    s.add_argument("--json", action="store_true", help="print results as JSON")
+    s.add_argument("-o", "--output", metavar="FILE", help="also save the full results as JSON to FILE")
+
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="reconkit",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="examples:\n"
+               "  reconkit scan example.com --brute -o report.json\n"
                "  reconkit subdomains example.com --brute --alive-only\n"
                "  reconkit headers https://example.com -v\n\n"
                "run 'reconkit <command> -h' for a command's options",
@@ -143,17 +238,10 @@ def build_parser() -> argparse.ArgumentParser:
                "  reconkit subdomains example.com --alive-only --json > subs.json",
     )
     s.add_argument("domain", help="domain to enumerate, e.g. example.com")
-    s.add_argument("--brute", action="store_true", help="also guess names from a wordlist via DNS")
-    s.add_argument("-w", "--wordlist", help="wordlist for --brute (default: built-in list)")
-    s.add_argument("--sources", help=f"comma-separated passive sources ({','.join(PASSIVE_SOURCES)})")
-    s.add_argument("--no-passive", action="store_true", help="skip third-party lookups")
+    add_enum_options(s)
     s.add_argument("--no-resolve", action="store_true", help="don't resolve passive results")
     s.add_argument("--alive-only", action="store_true", help="only print names that resolve")
-    s.add_argument("-t", "--threads", type=int, default=50,
-                   help="parallel DNS lookups (default: %(default)s)")
-    s.add_argument("-n", "--nameserver", action="append", help="DNS server to use (repeatable)")
-    s.add_argument("-q", "--quiet", action="store_true", help="no progress messages")
-    s.add_argument("--json", action="store_true", help="print results as JSON")
+    add_output_options(s)
     s.set_defaults(func=cmd_subdomains)
 
     h = sub.add_parser(
@@ -168,11 +256,35 @@ def build_parser() -> argparse.ArgumentParser:
     )
     h.add_argument("url", help="URL or bare host to fetch")
     h.add_argument("--no-cors", action="store_true", help="skip the CORS origin-reflection probe")
+    h.add_argument("--no-redirect", action="store_true", help="skip the HTTP-to-HTTPS redirect check")
     h.add_argument("--timeout", type=int, default=15,
                    help="request timeout in seconds (default: %(default)s)")
     h.add_argument("-v", "--verbose", action="store_true", help="show info notes and raw values")
-    h.add_argument("--json", action="store_true", help="print the report as JSON")
+    add_output_options(h)
     h.set_defaults(func=cmd_headers)
+
+    sc = sub.add_parser(
+        "scan", help="find subdomains, then audit every live one",
+        description="Enumerate subdomains, then for every host that resolves: grade its security "
+                    "headers and check for dangling CNAMEs (possible subdomain takeover). "
+                    "Results are sorted worst-first.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="examples:\n"
+               "  reconkit scan example.com\n"
+               "  reconkit scan example.com --brute -o report.json\n"
+               "  reconkit scan example.com --no-passive --brute --http-threads 20",
+    )
+    sc.add_argument("domain", help="domain to scan, e.g. example.com")
+    add_enum_options(sc)
+    sc.add_argument("--http-threads", type=int, default=10,
+                    help="hosts audited in parallel (default: %(default)s)")
+    sc.add_argument("--timeout", type=int, default=10,
+                    help="per-request timeout in seconds (default: %(default)s)")
+    sc.add_argument("--limit", type=int, help="audit at most this many hosts")
+    sc.add_argument("--no-cors", action="store_true", help="skip the CORS probe on each host")
+    sc.add_argument("--no-takeover", action="store_true", help="skip dangling-CNAME checks")
+    add_output_options(sc)
+    sc.set_defaults(func=cmd_scan)
     return p
 
 
