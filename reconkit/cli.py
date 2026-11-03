@@ -120,32 +120,58 @@ def cmd_headers(args) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="reconkit",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="examples:\n"
+               "  reconkit subdomains example.com --brute --alive-only\n"
+               "  reconkit headers https://example.com -v\n\n"
+               "run 'reconkit <command> -h' for a command's options",
         description="Recon tools for learning and authorized testing. "
                     "Only scan targets you own or have permission to test.",
     )
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    sub = p.add_subparsers(dest="command", required=True)
+    sub = p.add_subparsers(dest="command", required=True, metavar="<command>")
 
-    s = sub.add_parser("subdomains", help="discover subdomains of a domain")
-    s.add_argument("domain")
+    s = sub.add_parser(
+        "subdomains", help="discover subdomains of a domain",
+        description="Discover subdomains from certificate transparency logs and passive DNS, "
+                    "optionally brute-forcing names from a wordlist.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="examples:\n"
+               "  reconkit subdomains example.com\n"
+               "  reconkit subdomains example.com --brute -w words.txt -t 100\n"
+               "  reconkit subdomains example.com --no-passive --brute -n 1.1.1.1\n"
+               "  reconkit subdomains example.com --alive-only --json > subs.json",
+    )
+    s.add_argument("domain", help="domain to enumerate, e.g. example.com")
     s.add_argument("--brute", action="store_true", help="also guess names from a wordlist via DNS")
     s.add_argument("-w", "--wordlist", help="wordlist for --brute (default: built-in list)")
     s.add_argument("--sources", help=f"comma-separated passive sources ({','.join(PASSIVE_SOURCES)})")
     s.add_argument("--no-passive", action="store_true", help="skip third-party lookups")
     s.add_argument("--no-resolve", action="store_true", help="don't resolve passive results")
     s.add_argument("--alive-only", action="store_true", help="only print names that resolve")
-    s.add_argument("-t", "--threads", type=int, default=50)
+    s.add_argument("-t", "--threads", type=int, default=50,
+                   help="parallel DNS lookups (default: %(default)s)")
     s.add_argument("-n", "--nameserver", action="append", help="DNS server to use (repeatable)")
     s.add_argument("-q", "--quiet", action="store_true", help="no progress messages")
-    s.add_argument("--json", action="store_true")
+    s.add_argument("--json", action="store_true", help="print results as JSON")
     s.set_defaults(func=cmd_subdomains)
 
-    h = sub.add_parser("headers", help="audit a URL's security headers")
-    h.add_argument("url")
+    h = sub.add_parser(
+        "headers", help="audit a URL's security headers",
+        description="Fetch a URL and grade its security headers (HSTS, CSP, X-Frame-Options, "
+                    "cookies, CORS, ...), explaining why each issue matters and how to fix it.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="examples:\n"
+               "  reconkit headers https://example.com\n"
+               "  reconkit headers example.com -v          # https:// is assumed\n"
+               "  reconkit headers example.com --json --no-cors",
+    )
+    h.add_argument("url", help="URL or bare host to fetch")
     h.add_argument("--no-cors", action="store_true", help="skip the CORS origin-reflection probe")
-    h.add_argument("--timeout", type=int, default=15)
+    h.add_argument("--timeout", type=int, default=15,
+                   help="request timeout in seconds (default: %(default)s)")
     h.add_argument("-v", "--verbose", action="store_true", help="show info notes and raw values")
-    h.add_argument("--json", action="store_true")
+    h.add_argument("--json", action="store_true", help="print the report as JSON")
     h.set_defaults(func=cmd_headers)
     return p
 
