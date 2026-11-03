@@ -106,3 +106,79 @@ def test_passive_errors_are_collected(monkeypatch):
 def test_builtin_wordlist_loads():
     words = S.load_wordlist()
     assert "www" in words and len(words) == len(set(words))
+
+
+# ---------------- Wildcard CNAME filtering ----------------
+
+class CnameFakeResolver:
+    """Returns a CNAME for wildcard, distinct record for real hosts."""
+
+    def __init__(self, real_hosts):
+        self.real_hosts = real_hosts
+
+    def resolve(self, name):
+        if name in self.real_hosts:
+            return S.Resolution(name, self.real_hosts[name]["ips"],
+                                self.real_hosts[name].get("cnames", []))
+        return S.Resolution(name, ["10.0.0.1"], ["cdn-catchall.example.net"])
+
+
+def test_wildcard_cname_filtering(tmp_path):
+    wl = tmp_path / "w.txt"
+    wl.write_text("www\napi\nghost\n")
+    resolver = CnameFakeResolver({
+        "www.example.com": {"ips": ["1.1.1.1"], "cnames": ["www-real.example.net"]},
+        "api.example.com": {"ips": ["2.2.2.2"], "cnames": []},
+    })
+    r = S.enumerate_subdomains("example.com", passive=False, bruteforce=True,
+                               wordlist=str(wl), resolver=resolver, threads=2)
+    assert "www.example.com" in r.found
+    assert "api.example.com" in r.found
+    assert "ghost.example.com" not in r.found
+    assert "cdn-catchall.example.net" in r.wildcard_cnames
+
+
+def test_wildcard_signature_matches():
+    sig = S.WildcardSignature(ips={"10.0.0.1"}, cnames={"cdn.example.net"})
+    assert sig.matches(S.Resolution("a.example.com", ["10.0.0.1"]))
+    assert sig.matches(S.Resolution("b.example.com", ["99.99.99.99"], ["cdn.example.net"]))
+    assert not sig.matches(S.Resolution("c.example.com", ["1.2.3.4"], ["other.example.net"]))
+    assert not sig.matches(S.Resolution("d.example.com", []))
+
+
+# ---------------- SERVFAIL retry ----------------
+
+def test_resolver_retries_servfail(monkeypatch):
+    import dns.resolver
+    r = S.Resolver()
+    calls = []
+
+    def fake_resolve(name, rtype):
+        calls.append((name, rtype))
+        raise dns.resolver.NoNameservers("SERVFAIL")
+
+    monkeypatch.setattr(r._r, "resolve", fake_resolve)
+    res = r.resolve("fail.example.com")
+    assert res.error and "SERVFAIL" in res.error
+    assert len(calls) >= 3  # 1 original + 2 retries for the first rtype
+
+
+def test_resolver_servfail_succeeds_on_retry(monkeypatch):
+    import dns.resolver as dr
+    import dns.rdatatype
+    r = S.Resolver()
+    attempt = [0]
+
+    class FakeAnswer:
+        class response:
+            answer = []
+
+    def fake_resolve(name, rtype):
+        attempt[0] += 1
+        if attempt[0] <= 1:
+            raise dr.NoNameservers("SERVFAIL")
+        return FakeAnswer()
+
+    monkeypatch.setattr(r._r, "resolve", fake_resolve)
+    res = r.resolve("retry.example.com")
+    assert res.error is None

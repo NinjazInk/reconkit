@@ -89,6 +89,8 @@ def cmd_subdomains(args) -> int:
             detail += "  [" + ", ".join(r["addresses"]) + "]"
         if r.get("dangling"):
             detail += "  " + c("(CNAME target does not resolve: possible takeover)", "high", color)
+        elif r.get("dns_error"):
+            detail += "  " + c(f"(DNS error: {r['dns_error']})", "medium", color)
         elif resolved and not alive:
             detail += "  (no DNS record)"
         name = c(r["name"], "ok" if alive else "dim", color)
@@ -114,8 +116,15 @@ def cmd_headers(args) -> int:
 
     color = _use_color(sys.stdout)
     print(f"URL:    {report.final_url}  (HTTP {report.status})")
+    if report.blocked_by:
+        print(c(f"\nBLOCKED by {report.blocked_by} bot protection. The response is a challenge page, "
+                "not the real site. Header grades would be meaningless.\n"
+                "Try from an allowed IP, or skip this host.", "high", color))
+        return 0
     grade_color = "ok" if report.grade in "AB" else "medium" if report.grade == "C" else "high"
     print(f"Grade:  {c(report.grade, grade_color, color)}  (score {report.score}/100)\n")
+    if report.meta_csp:
+        print(c("note: CSP was set via <meta> tag, not an HTTP header.\n", "medium", color))
     if report.status >= 400:
         print(c(f"warning: HTTP {report.status} - this may be an error page from a proxy, WAF or "
                 "load balancer, whose headers can differ from the real site's.\n", "medium", color))
@@ -168,7 +177,11 @@ def cmd_scan(args) -> int:
     width = max(len(h.name) for h in hosts)
     print(f"\n{'HOST':<{width}}  HTTP  GRADE  HIGH MED LOW  TOP ISSUE")
     for h in hosts:
-        if h.report:
+        if h.report and h.report.blocked_by:
+            status = str(h.report.status)
+            blk = c("BLOCKED", "high", color)
+            cols = f"{status:<4}  {blk}  {'':>4} {'':>3} {'':>3}  bot protection ({h.report.blocked_by})"
+        elif h.report:
             k = h.counts()
             grade = h.report.grade
             gcol = "ok" if grade in "AB" else "medium" if grade == "C" else "high"

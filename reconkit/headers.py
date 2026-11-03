@@ -36,6 +36,8 @@ class HeaderReport:
     findings: list[Finding]
     score: int
     grade: str
+    blocked_by: str | None = None
+    meta_csp: str | None = None
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -64,6 +66,53 @@ def grade_for(score: int) -> str:
         if score >= threshold:
             return letter
     return "F"
+
+
+CHALLENGE_SIGNATURES = [
+    (r"cf-mitigated.*challenge", "Cloudflare"),
+    (r"<title>\s*just a moment", "Cloudflare"),
+    (r"cdn-cgi/challenge-platform", "Cloudflare"),
+    (r"managed challenge", "Cloudflare"),
+    (r"akamai bot manager", "Akamai"),
+    (r"access denied.*reference\s*#", "Akamai"),
+    (r"<title>\s*ddos-guard", "DDoS-Guard"),
+    (r"<title>\s*attention required.*cloudflare", "Cloudflare"),
+    (r"<title>\s*access denied", "WAF"),
+    (r"sucuri website firewall", "Sucuri"),
+    (r"you have been blocked", "WAF"),
+    (r"_cf_chl_opt", "Cloudflare"),
+]
+
+
+def detect_challenge_page(resp: requests.Response) -> str | None:
+    body = resp.text[:50_000].lower()
+    for pattern, provider in CHALLENGE_SIGNATURES:
+        if re.search(pattern, body, re.I | re.S):
+            if resp.status_code in (403, 503):
+                return provider
+    cf_header = resp.headers.get("cf-mitigated")
+    if cf_header and "challenge" in cf_header.lower():
+        return "Cloudflare"
+    server = resp.headers.get("Server", "").lower()
+    if resp.status_code == 503 and "ddos-guard" in server:
+        return "DDoS-Guard"
+    return None
+
+
+def extract_meta_csp(body: str) -> str | None:
+    m = re.search(
+        r'<meta\s[^>]*http-equiv\s*=\s*"Content-Security-Policy"'
+        r'\s[^>]*content\s*=\s*"([^"]+)"',
+        body, re.I | re.S,
+    )
+    if m:
+        return m.group(1)
+    m = re.search(
+        r'<meta\s[^>]*content\s*=\s*"([^"]+)"'
+        r'\s[^>]*http-equiv\s*=\s*"Content-Security-Policy"',
+        body, re.I | re.S,
+    )
+    return m.group(1) if m else None
 
 
 # --------------------------------------------------------------------------- #
@@ -110,9 +159,11 @@ def check_hsts(h, is_https: bool) -> list[Finding]:
     return out
 
 
-def check_csp(h) -> list[Finding]:
+def check_csp(h, meta_csp: str | None = None) -> list[Finding]:
     v = h.get("Content-Security-Policy")
     ro = h.get("Content-Security-Policy-Report-Only")
+    if not v and meta_csp:
+        v = meta_csp
     if not v:
         if ro:
             return [Finding("Content-Security-Policy", "medium", "CSP is report-only",
@@ -356,12 +407,13 @@ def check_https_redirect(url: str, session: requests.Session, timeout: int,
 
 # --------------------------------------------------------------------------- #
 
-def analyze_response(resp: requests.Response, url: str) -> list[Finding]:
+def analyze_response(resp: requests.Response, url: str,
+                     meta_csp: str | None = None) -> list[Finding]:
     h = resp.headers  # requests' CaseInsensitiveDict
     is_https = urlparse(resp.url).scheme == "https"
     findings: list[Finding] = []
     findings += check_hsts(h, is_https)
-    findings += check_csp(h)
+    findings += check_csp(h, meta_csp=meta_csp)
     findings += check_xfo(h)
     findings += check_xcto(h)
     findings += check_referrer(h)
@@ -377,7 +429,17 @@ def analyze(url: str, *, session: requests.Session | None = None, timeout: int =
     url = normalize_url(url)
     session = session or make_session()
     resp = session.get(url, timeout=timeout, allow_redirects=True)
-    findings = analyze_response(resp, url)
+
+    challenge = detect_challenge_page(resp)
+    if challenge:
+        return HeaderReport(
+            url=url, final_url=resp.url, status=resp.status_code,
+            headers=dict(resp.headers), findings=[], score=0,
+            grade="!", blocked_by=challenge,
+        )
+
+    meta_csp = extract_meta_csp(resp.text[:200_000]) if resp.text else None
+    findings = analyze_response(resp, url, meta_csp=meta_csp)
     if cors:
         findings += check_cors(resp.url, session, timeout)
     if redirect and urlparse(resp.url).scheme == "https":
@@ -386,4 +448,4 @@ def analyze(url: str, *, session: requests.Session | None = None, timeout: int =
     score = max(0, 100 - sum(SEVERITY_WEIGHT[f.severity] for f in findings))
     return HeaderReport(url=url, final_url=resp.url, status=resp.status_code,
                         headers=dict(resp.headers), findings=findings,
-                        score=score, grade=grade_for(score))
+                        score=score, grade=grade_for(score), meta_csp=meta_csp)

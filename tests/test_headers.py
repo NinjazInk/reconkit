@@ -120,3 +120,65 @@ def test_cors_reflection(monkeypatch):
                               "Access-Control-Allow-Credentials": "true"})
     f = H.check_cors("https://example.com/", FakeSession(), 5)
     assert f[0].severity == "high"
+
+
+# ---------------- Meta CSP ----------------
+
+def test_extract_meta_csp():
+    html = '<html><head><meta http-equiv="Content-Security-Policy" content="default-src \'self\'"></head></html>'
+    assert H.extract_meta_csp(html) == "default-src 'self'"
+
+
+def test_extract_meta_csp_reversed_attrs():
+    html = "<meta content=\"script-src 'none'\" http-equiv=\"Content-Security-Policy\">"
+    assert H.extract_meta_csp(html) == "script-src 'none'"
+
+
+def test_extract_meta_csp_returns_none():
+    assert H.extract_meta_csp("<html><head></head></html>") is None
+
+
+def test_meta_csp_used_when_header_missing():
+    resp = make_resp({})
+    findings = H.analyze_response(resp, "https://example.com/",
+                                  meta_csp="default-src 'self'; object-src 'none'; base-uri 'none'")
+    t = titles(findings)
+    assert "CSP missing" not in t
+
+
+# ---------------- Challenge page detection ----------------
+
+def test_detect_challenge_cloudflare():
+    r = make_resp({})
+    r.status_code = 503
+    r._content = b'<html><head><title>Just a moment...</title></head><body>challenge</body></html>'
+    assert H.detect_challenge_page(r) == "Cloudflare"
+
+
+def test_detect_challenge_cf_header():
+    r = make_resp({"cf-mitigated": "challenge"})
+    r.status_code = 200
+    r._content = b''
+    assert H.detect_challenge_page(r) == "Cloudflare"
+
+
+def test_no_challenge_normal_page():
+    r = make_resp({})
+    r.status_code = 200
+    r._content = b'<html><body>Hello world</body></html>'
+    assert H.detect_challenge_page(r) is None
+
+
+def test_challenge_page_not_graded():
+    r = make_resp({})
+    r.status_code = 403
+    r._content = b'<html><title>Attention Required! | Cloudflare</title></html>'
+
+    class FakeSession:
+        def get(self, url, **kw):
+            return r
+
+    report = H.analyze("https://example.com", session=FakeSession())
+    assert report.blocked_by == "Cloudflare"
+    assert report.grade == "!"
+    assert report.findings == []

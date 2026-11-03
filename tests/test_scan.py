@@ -157,7 +157,7 @@ def test_scan_orders_and_combines(monkeypatch):
 
     def fake_analyze(url, **kw):
         score = 95 if "good" in url else 30
-        return H.HeaderReport(url, url, 200, {}, [], score, H.grade_for(score))
+        return H.HeaderReport(url, url, 200, {}, [], score, H.grade_for(score), blocked_by=None)
     monkeypatch.setattr(SC, "analyze", fake_analyze)
 
     result = SC.scan("example.com", http_threads=2)

@@ -46,6 +46,7 @@ class Resolution:
     # True when the name has a CNAME but the chain ends in NXDOMAIN: the alias
     # points at something that no longer exists (a subdomain-takeover signal).
     dangling: bool = False
+    error: str | None = None
 
     @property
     def alive(self) -> bool:
@@ -58,6 +59,7 @@ class SubdomainResult:
     found: dict[str, set[str]] = field(default_factory=dict)  # name -> sources
     resolved: dict[str, Resolution] = field(default_factory=dict)
     wildcard_ips: set[str] = field(default_factory=set)
+    wildcard_cnames: set[str] = field(default_factory=set)
     errors: list[str] = field(default_factory=list)
 
     def add(self, name: str, source: str) -> None:
@@ -73,10 +75,12 @@ class SubdomainResult:
                 "addresses": r.addresses if r else None,
                 "cnames": r.cnames if r else None,
                 "dangling": r.dangling if r else None,
+                "dns_error": r.error if r else None,
             })
         return {
             "domain": self.domain,
             "wildcard_ips": sorted(self.wildcard_ips),
+            "wildcard_cnames": sorted(self.wildcard_cnames),
             "subdomains": out,
             "errors": self.errors,
         }
@@ -165,6 +169,8 @@ PASSIVE_SOURCES: dict[str, Callable[[str, requests.Session], set[str]]] = {
 # --------------------------------------------------------------------------- #
 
 class Resolver:
+    SERVFAIL_RETRIES = 2
+
     def __init__(self, nameservers: list[str] | None = None, timeout: float = 3.0):
         self.timeout = timeout
         if HAVE_DNSPYTHON:
@@ -173,6 +179,15 @@ class Resolver:
                 self._r.nameservers = nameservers
             self._r.timeout = timeout
             self._r.lifetime = timeout * 2
+
+    def _resolve_rtype(self, name: str, rtype: str):
+        last_exc = None
+        for attempt in range(1 + self.SERVFAIL_RETRIES):
+            try:
+                return self._r.resolve(name, rtype)
+            except dns.resolver.NoNameservers as exc:
+                last_exc = exc
+        raise last_exc
 
     def resolve(self, name: str) -> Resolution:
         res = Resolution(name)
@@ -185,14 +200,12 @@ class Resolver:
             return res
         for rtype in ("A", "AAAA"):
             try:
-                answer = self._r.resolve(name, rtype)
+                answer = self._resolve_rtype(name, rtype)
             except dns.resolver.NXDOMAIN:
-                # Either the name doesn't exist, or it's a CNAME whose target
-                # doesn't. Ask for the CNAME itself (servers answer that without
-                # following the chain) to tell the two apart.
                 self._check_dangling(name, res)
                 return res
             except dns.resolver.NoNameservers:
+                res.error = "SERVFAIL (server failure) after retries"
                 return res
             except (dns.resolver.NoAnswer, dns.exception.Timeout):
                 continue
@@ -217,14 +230,31 @@ class Resolver:
         res.dangling = bool(res.cnames)
 
 
-def detect_wildcard(domain: str, resolver: Resolver, probes: int = 3) -> set[str]:
-    """Resolve random labels; any answers mean a wildcard record exists."""
-    ips: set[str] = set()
+@dataclass
+class WildcardSignature:
+    ips: set[str] = field(default_factory=set)
+    cnames: set[str] = field(default_factory=set)
+
+    def matches(self, res: Resolution) -> bool:
+        if not self.ips and not self.cnames:
+            return False
+        if res.cnames:
+            if set(res.cnames) & self.cnames:
+                return True
+        if res.addresses and self.ips:
+            if set(res.addresses) <= self.ips:
+                return True
+        return False
+
+
+def detect_wildcard(domain: str, resolver: Resolver, probes: int = 3) -> WildcardSignature:
+    sig = WildcardSignature()
     for _ in range(probes):
         label = "rk-" + secrets.token_hex(8)
         r = resolver.resolve(f"{label}.{domain}")
-        ips.update(r.addresses)
-    return ips
+        sig.ips.update(r.addresses)
+        sig.cnames.update(r.cnames)
+    return sig
 
 
 def load_wordlist(path: str | None = None) -> list[str]:
@@ -295,9 +325,12 @@ def enumerate_subdomains(
                 result.add(h, name)
 
     if bruteforce:
-        result.wildcard_ips = detect_wildcard(domain, resolver)
-        if result.wildcard_ips:
-            log(f"[brute] wildcard DNS detected -> {', '.join(sorted(result.wildcard_ips))}")
+        wc = detect_wildcard(domain, resolver)
+        result.wildcard_ips = wc.ips
+        result.wildcard_cnames = wc.cnames
+        if wc.ips or wc.cnames:
+            parts = sorted(wc.ips) + sorted(wc.cnames)
+            log(f"[brute] wildcard DNS detected -> {', '.join(parts)}")
         words = load_wordlist(wordlist)
         candidates = [f"{w}.{domain}" for w in words]
         log(f"[brute] trying {len(candidates)} names with {threads} threads ...")
@@ -305,8 +338,8 @@ def enumerate_subdomains(
         for name, r in resolved.items():
             if not r.alive:
                 continue
-            if result.wildcard_ips and set(r.addresses) <= result.wildcard_ips and not r.cnames:
-                continue  # just the wildcard answering
+            if wc.matches(r):
+                continue
             result.add(name, "bruteforce")
             result.resolved[name] = r
 
