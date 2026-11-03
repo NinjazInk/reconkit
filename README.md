@@ -1,7 +1,7 @@
 # reconkit
 
-Small, readable reconnaissance tools for learning web security and for
-**authorized** testing. The code is commented to explain *why* each technique
+Small, readable reconnaissance tools for web security and for
+authorized testing. The code is commented to explain *why* each technique
 works, not just what it does.
 
 > Only run these against domains and sites you own or have written permission
