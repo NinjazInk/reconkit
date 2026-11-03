@@ -13,7 +13,7 @@ from typing import Callable
 import requests
 
 from . import takeover as T
-from .headers import HeaderReport, analyze
+from .headers import HeaderReport, analyze, analyze_paths
 from .http import make_session
 from .subdomains import Resolution, SubdomainResult, enumerate_subdomains
 
@@ -24,6 +24,7 @@ class HostResult:
     report: HeaderReport | None = None
     error: str | None = None
     takeover: T.TakeoverFinding | None = None
+    path_reports: list[HeaderReport] = field(default_factory=list)
 
     def counts(self) -> dict[str, int]:
         out = {"high": 0, "medium": 0, "low": 0}
@@ -35,7 +36,7 @@ class HostResult:
 
     def to_dict(self) -> dict:
         r = self.report
-        return {
+        d = {
             "name": self.name,
             "url": r.final_url if r else None,
             "status": r.status if r else None,
@@ -46,6 +47,9 @@ class HostResult:
             "error": self.error,
             "takeover": self.takeover.to_dict() if self.takeover else None,
         }
+        if self.path_reports:
+            d["paths"] = [pr.to_dict() for pr in self.path_reports]
+        return d
 
 
 @dataclass
@@ -66,7 +70,8 @@ class ScanResult:
         }
 
 
-def audit_host(res: Resolution, *, timeout: int, cors: bool, check_takeover: bool) -> HostResult:
+def audit_host(res: Resolution, *, timeout: int, cors: bool,
+               check_takeover: bool, extra_paths: list[str] | None = None) -> HostResult:
     session = make_session()  # one per thread: requests.Session isn't thread-safe
     out = HostResult(res.name)
     if check_takeover:
@@ -78,13 +83,20 @@ def audit_host(res: Resolution, *, timeout: int, cors: bool, check_takeover: boo
         out.error = out.error or "no address (CNAME target does not resolve)"
         return out
     last_exc: Exception | None = None
+    base_url: str | None = None
     for scheme in ("https", "http"):
         try:
             out.report = analyze(f"{scheme}://{res.name}", session=session, timeout=timeout, cors=cors)
-            return out
+            base_url = f"{scheme}://{res.name}"
+            break
         except requests.RequestException as exc:
             last_exc = exc
-    out.error = f"no HTTP(S) response ({type(last_exc).__name__})"
+    if not out.report:
+        out.error = f"no HTTP(S) response ({type(last_exc).__name__})"
+        return out
+    if extra_paths and base_url:
+        out.path_reports = analyze_paths(base_url, extra_paths, session=session,
+                                         timeout=timeout, cors=cors, redirect=False)
     return out
 
 
@@ -101,6 +113,7 @@ def scan(
     cors: bool = True,
     check_takeover: bool = True,
     limit: int | None = None,
+    extra_paths: list[str] | None = None,
     log: Callable[[str], None] = lambda _m: None,
     **enum_kwargs,
 ) -> ScanResult:
@@ -111,7 +124,8 @@ def scan(
     result = ScanResult(subs.domain, subs)
     log(f"[scan] auditing {len(live)} live hosts with {http_threads} threads ...")
     with ThreadPoolExecutor(max_workers=http_threads) as pool:
-        futures = [pool.submit(audit_host, r, timeout=timeout, cors=cors, check_takeover=check_takeover)
+        futures = [pool.submit(audit_host, r, timeout=timeout, cors=cors,
+                               check_takeover=check_takeover, extra_paths=extra_paths)
                    for r in live]
         for i, fut in enumerate(as_completed(futures), 1):
             h = fut.result()

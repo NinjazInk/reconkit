@@ -9,7 +9,7 @@ import sys
 import requests
 
 from . import __version__
-from .headers import analyze
+from .headers import analyze, analyze_paths
 from .scan import scan
 from .subdomains import PASSIVE_SOURCES, enumerate_subdomains
 
@@ -101,26 +101,13 @@ def cmd_subdomains(args) -> int:
     return 0
 
 
-def cmd_headers(args) -> int:
-    try:
-        report = analyze(args.url, timeout=args.timeout, cors=not args.no_cors,
-                         redirect=not args.no_redirect)
-    except requests.RequestException as exc:
-        log(f"request failed: {exc}")
-        return 1
-
-    save_output(args, report.to_dict())
-    if args.json:
-        print(json.dumps(report.to_dict(), indent=2))
-        return 0
-
-    color = _use_color(sys.stdout)
+def _print_report(report, color: bool, verbose: bool) -> None:
     print(f"URL:    {report.final_url}  (HTTP {report.status})")
     if report.blocked_by:
         print(c(f"\nBLOCKED by {report.blocked_by} bot protection. The response is a challenge page, "
                 "not the real site. Header grades would be meaningless.\n"
                 "Try from an allowed IP, or skip this host.", "high", color))
-        return 0
+        return
     grade_color = "ok" if report.grade in "AB" else "medium" if report.grade == "C" else "high"
     print(f"Grade:  {c(report.grade, grade_color, color)}  (score {report.score}/100)\n")
     if report.meta_csp:
@@ -131,23 +118,55 @@ def cmd_headers(args) -> int:
     if not report.findings:
         print(c("No issues found.", "ok", color))
     for f in report.findings:
-        if f.severity == "info" and not args.verbose:
+        if f.severity == "info" and not verbose:
             continue
         tag = c(f"[{f.severity.upper():6}]", f.severity, color)
         print(f"{tag} {f.title}")
         print(f"         why: {f.why}")
         if f.fix:
             print(f"         fix: {f.fix}")
-        if f.value and args.verbose:
+        if f.value and verbose:
             print(c(f"         got: {f.value}", "dim", color))
         print()
     hidden = sum(1 for f in report.findings if f.severity == "info")
-    if hidden and not args.verbose:
+    if hidden and not verbose:
         log(f"({hidden} informational notes hidden; use -v to show)")
+
+
+def cmd_headers(args) -> int:
+    paths = args.paths.split(",") if getattr(args, "paths", None) else None
+    try:
+        if paths:
+            reports = analyze_paths(args.url, paths, timeout=args.timeout,
+                                    cors=not args.no_cors, redirect=not args.no_redirect)
+        else:
+            reports = [analyze(args.url, timeout=args.timeout, cors=not args.no_cors,
+                               redirect=not args.no_redirect)]
+    except requests.RequestException as exc:
+        log(f"request failed: {exc}")
+        return 1
+
+    if not reports:
+        log("no paths returned a response")
+        return 1
+
+    all_data = [r.to_dict() for r in reports]
+    save_output(args, all_data[0] if len(all_data) == 1 else {"paths": all_data})
+    if args.json:
+        out = all_data[0] if len(all_data) == 1 else {"paths": all_data}
+        print(json.dumps(out, indent=2))
+        return 0
+
+    color = _use_color(sys.stdout)
+    for i, report in enumerate(reports):
+        if i > 0:
+            print(c("\n" + "=" * 60 + "\n", "dim", color))
+        _print_report(report, color, args.verbose)
     return 0
 
 
 def cmd_scan(args) -> int:
+    extra_paths = args.paths.split(",") if getattr(args, "paths", None) else None
     try:
         result = scan(
             args.domain,
@@ -156,6 +175,7 @@ def cmd_scan(args) -> int:
             cors=not args.no_cors,
             check_takeover=not args.no_takeover,
             limit=args.limit,
+            extra_paths=extra_paths,
             log=log if not args.quiet else (lambda _m: None),
             **enum_kwargs(args),
         )
@@ -199,6 +219,17 @@ def cmd_scan(args) -> int:
             print(f"  {c(t.confidence.upper(), 'high', color)} {t.name} -> {' -> '.join(t.cnames)}  [{svc}]")
             for e in t.evidence:
                 print(f"         {e}")
+    if any(h.path_reports for h in hosts):
+        print(c("\nPer-path findings:", "medium", color))
+        for h in hosts:
+            for pr in h.path_reports:
+                if pr.blocked_by:
+                    print(f"  {h.name} {pr.final_url}: {c('BLOCKED', 'high', color)} ({pr.blocked_by})")
+                elif pr.findings:
+                    worst = next((f for f in pr.findings if f.severity in ("high", "medium")), pr.findings[0])
+                    gcol = "ok" if pr.grade in "AB" else "medium" if pr.grade == "C" else "high"
+                    print(f"  {h.name} {pr.final_url}: {c(pr.grade, gcol, color)} - {worst.title}")
+
     graded = [h for h in hosts if h.report]
     weak = sum(1 for h in graded if h.report.grade in "DF")
     log(f"\n{len(hosts)} live hosts, {len(graded)} answered HTTP(S), {weak} graded D or F, "
@@ -268,6 +299,7 @@ def build_parser() -> argparse.ArgumentParser:
                "  reconkit headers example.com --json --no-cors",
     )
     h.add_argument("url", help="URL or bare host to fetch")
+    h.add_argument("--paths", help="comma-separated paths to check (e.g. /,/api,/admin)")
     h.add_argument("--no-cors", action="store_true", help="skip the CORS origin-reflection probe")
     h.add_argument("--no-redirect", action="store_true", help="skip the HTTP-to-HTTPS redirect check")
     h.add_argument("--timeout", type=int, default=15,
@@ -294,6 +326,7 @@ def build_parser() -> argparse.ArgumentParser:
     sc.add_argument("--timeout", type=int, default=10,
                     help="per-request timeout in seconds (default: %(default)s)")
     sc.add_argument("--limit", type=int, help="audit at most this many hosts")
+    sc.add_argument("--paths", help="comma-separated paths to also check per host (e.g. /api,/admin)")
     sc.add_argument("--no-cors", action="store_true", help="skip the CORS probe on each host")
     sc.add_argument("--no-takeover", action="store_true", help="skip dangling-CNAME checks")
     add_output_options(sc)

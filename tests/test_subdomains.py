@@ -182,3 +182,54 @@ def test_resolver_servfail_succeeds_on_retry(monkeypatch):
     monkeypatch.setattr(r._r, "resolve", fake_resolve)
     res = r.resolve("retry.example.com")
     assert res.error is None
+
+
+# ---------------- CDN HTTP fingerprint wildcard ----------------
+
+def test_wildcard_http_fingerprint_matches():
+    sig = S.WildcardSignature(
+        ips={"10.0.0.1", "10.0.0.2"},
+        http_fingerprints={(200, 1234)},
+    )
+    assert sig.matches_http(200, 1234)
+    assert not sig.matches_http(200, 5678)
+    assert not sig.matches_http(404, 1234)
+
+
+class CdnFakeResolver:
+    """All names resolve to CDN IPs; real hosts have different content."""
+
+    def __init__(self):
+        pass
+
+    def resolve(self, name):
+        return S.Resolution(name, ["10.0.0.1", "10.0.0.2"])
+
+
+def test_cdn_wildcard_http_filtering(tmp_path, monkeypatch):
+    import requests as rq
+
+    wl = tmp_path / "w.txt"
+    wl.write_text("www\napi\nghost\n")
+
+    call_log = []
+
+    class FakeSession:
+        def get(self, url, **kw):
+            call_log.append(url)
+            r = rq.Response()
+            r.status_code = 200
+            r.url = url
+            if "www" in url:
+                r._content = b"real site content that is unique"
+            else:
+                r._content = b"default page"
+            return r
+
+    r = S.enumerate_subdomains(
+        "example.com", passive=False, bruteforce=True,
+        wordlist=str(wl), resolver=CdnFakeResolver(),
+        session=FakeSession(), threads=2,
+    )
+    assert "www.example.com" in r.found
+    assert "ghost.example.com" not in r.found

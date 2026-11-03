@@ -31,6 +31,9 @@ GOOD = {
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "strict-origin-when-cross-origin",
     "Permissions-Policy": "camera=()",
+    "Cross-Origin-Opener-Policy": "same-origin",
+    "Cross-Origin-Embedder-Policy": "require-corp",
+    "Cross-Origin-Resource-Policy": "same-origin",
 }
 
 
@@ -182,3 +185,75 @@ def test_challenge_page_not_graded():
     assert report.blocked_by == "Cloudflare"
     assert report.grade == "!"
     assert report.findings == []
+
+
+# ---------------- Dual CSP headers ----------------
+
+def test_split_multi_csp_single():
+    assert H.split_multi_csp("default-src 'self'") == ["default-src 'self'"]
+
+
+def test_split_multi_csp_two_policies():
+    raw = "default-src 'self'; script-src 'none', default-src https:"
+    parts = H.split_multi_csp(raw)
+    assert len(parts) == 2
+    assert parts[0] == "default-src 'self'; script-src 'none'"
+    assert parts[1] == "default-src https:"
+
+
+def test_split_multi_csp_comma_in_value():
+    raw = "default-src 'self'; report-uri https://example.com/csp,/other"
+    parts = H.split_multi_csp(raw)
+    assert len(parts) == 1
+
+
+def test_dual_csp_produces_info_finding():
+    h = CaseInsensitiveDict({
+        "Content-Security-Policy": "default-src 'self'; object-src 'none'; base-uri 'none', script-src 'none'"
+    })
+    t = titles(H.check_csp(h))
+    assert any("Multiple CSP" in x for x in t)
+
+
+# ---------------- Newer headers (COOP, COEP, CORP) ----------------
+
+def test_coop_missing():
+    assert H.check_coop(CaseInsensitiveDict())[0].header == "Cross-Origin-Opener-Policy"
+
+
+def test_coop_present():
+    assert H.check_coop(CaseInsensitiveDict({"Cross-Origin-Opener-Policy": "same-origin"})) == []
+
+
+def test_coep_missing():
+    assert H.check_coep(CaseInsensitiveDict())[0].header == "Cross-Origin-Embedder-Policy"
+
+
+def test_corp_missing():
+    assert H.check_corp(CaseInsensitiveDict())[0].header == "Cross-Origin-Resource-Policy"
+
+
+# ---------------- __Host- cookie prefix ----------------
+
+def test_host_prefix_correct():
+    cookies = ["__Host-sess=abc; Secure; Path=/"]
+    assert H.check_host_cookie_prefix(cookies, is_https=True) == []
+
+
+def test_host_prefix_missing_secure():
+    cookies = ["__Host-sess=abc; Path=/"]
+    f = H.check_host_cookie_prefix(cookies, is_https=True)
+    assert len(f) == 1
+    assert "Secure" in f[0].title
+
+
+def test_host_prefix_has_domain():
+    cookies = ["__Host-sess=abc; Secure; Path=/; Domain=example.com"]
+    f = H.check_host_cookie_prefix(cookies, is_https=True)
+    assert len(f) == 1
+    assert "Domain" in f[0].title
+
+
+def test_host_prefix_skipped_on_http():
+    cookies = ["__Host-sess=abc; Path=/"]
+    assert H.check_host_cookie_prefix(cookies, is_https=False) == []

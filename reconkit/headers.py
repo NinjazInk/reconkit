@@ -159,6 +159,31 @@ def check_hsts(h, is_https: bool) -> list[Finding]:
     return out
 
 
+def split_multi_csp(raw: str) -> list[str]:
+    """Split comma-joined CSP headers back into individual policies.
+
+    HTTP allows multiple CSP headers; requests joins them with ', '.
+    A real directive never starts with a comma, so we split on commas
+    that are followed by a known directive name.
+    """
+    known = {"default-src", "script-src", "style-src", "img-src", "connect-src",
+             "font-src", "object-src", "media-src", "frame-src", "child-src",
+             "worker-src", "frame-ancestors", "form-action", "base-uri",
+             "manifest-src", "navigate-to", "report-uri", "report-to",
+             "require-trusted-types-for", "trusted-types", "sandbox",
+             "upgrade-insecure-requests", "block-all-mixed-content",
+             "plugin-types", "prefetch-src"}
+    parts = re.split(r",\s*", raw)
+    policies: list[str] = [parts[0]]
+    for part in parts[1:]:
+        first_token = part.strip().split()[0].lower() if part.strip() else ""
+        if first_token in known:
+            policies.append(part)
+        else:
+            policies[-1] += ", " + part
+    return policies
+
+
 def check_csp(h, meta_csp: str | None = None) -> list[Finding]:
     v = h.get("Content-Security-Policy")
     ro = h.get("Content-Security-Policy-Report-Only")
@@ -175,8 +200,16 @@ def check_csp(h, meta_csp: str | None = None) -> list[Finding]:
                         "scripts, styles and frames can load from. Without it any injected <script> runs.",
                         "Start with: default-src 'self'; object-src 'none'; base-uri 'self'; "
                         "frame-ancestors 'self'")]
-    d = parse_csp(v)
+    policies = split_multi_csp(v)
     out = []
+    if len(policies) > 1:
+        out.append(Finding("Content-Security-Policy", "info",
+                           f"Multiple CSP policies detected ({len(policies)})",
+                           "The server sent multiple CSP headers (or a comma-joined one). "
+                           "Browsers apply all of them (intersection), so the strictest wins. "
+                           "Only the first is analyzed here.",
+                           "Consolidate into a single Content-Security-Policy header.", v[:200]))
+    d = parse_csp(policies[0])
     script = d.get("script-src", d.get("default-src"))
     if script is None:
         out.append(Finding("Content-Security-Policy", "high", "CSP has no script-src or default-src",
@@ -327,6 +360,64 @@ def check_cookies(set_cookies: list[str], is_https: bool) -> list[Finding]:
     return out
 
 
+def check_coop(h) -> list[Finding]:
+    v = h.get("Cross-Origin-Opener-Policy")
+    if not v:
+        return [Finding("Cross-Origin-Opener-Policy", "info", "COOP missing",
+                        "Without COOP, other windows opened from this site share a browsing context "
+                        "group, which can leak information via side channels (e.g. Spectre).",
+                        "Cross-Origin-Opener-Policy: same-origin")]
+    return []
+
+
+def check_coep(h) -> list[Finding]:
+    v = h.get("Cross-Origin-Embedder-Policy")
+    if not v:
+        return [Finding("Cross-Origin-Embedder-Policy", "info", "COEP missing",
+                        "Without COEP, cross-origin resources can be loaded without explicit opt-in, "
+                        "and the page cannot use SharedArrayBuffer or high-resolution timers.",
+                        "Cross-Origin-Embedder-Policy: require-corp")]
+    return []
+
+
+def check_corp(h) -> list[Finding]:
+    v = h.get("Cross-Origin-Resource-Policy")
+    if not v:
+        return [Finding("Cross-Origin-Resource-Policy", "info", "CORP missing",
+                        "Without CORP, other sites can embed this resource in img/script/iframe tags. "
+                        "For same-site resources this leaks data to cross-origin pages.",
+                        "Cross-Origin-Resource-Policy: same-origin (or same-site)")]
+    return []
+
+
+def check_host_cookie_prefix(set_cookies: list[str], is_https: bool) -> list[Finding]:
+    if not is_https:
+        return []
+    out = []
+    for raw in set_cookies:
+        name = raw.split("=", 1)[0].strip()
+        if not name.startswith("__Host-"):
+            continue
+        attrs = {a.strip().split("=", 1)[0].lower(): (a.split("=", 1)[1].strip() if "=" in a else "")
+                 for a in raw.split(";")[1:]}
+        problems = []
+        if "secure" not in attrs:
+            problems.append("Secure")
+        path_val = attrs.get("path", "").strip()
+        if path_val != "/":
+            problems.append("Path=/")
+        if "domain" in attrs:
+            problems.append("no Domain")
+        if problems:
+            out.append(Finding("Set-Cookie", "medium",
+                               f"__Host- cookie '{name}' violates prefix rules ({', '.join(problems)} required)",
+                               "__Host- cookies must have Secure, Path=/ and no Domain attribute. "
+                               "Browsers reject cookies that break these rules, so the cookie is silently dropped.",
+                               f"Set: {name}=...; Secure; Path=/  (and remove any Domain attribute).",
+                               raw[:200]))
+    return out
+
+
 def check_cors(url: str, session: requests.Session, timeout: int) -> list[Finding]:
     """Send a request with a foreign Origin and see whether it is reflected."""
     probe_origin = "https://reconkit-cors-probe.example"
@@ -420,7 +511,12 @@ def analyze_response(resp: requests.Response, url: str,
     findings += check_permissions_policy(h)
     findings += check_xss_protection(h)
     findings += check_disclosure(h)
-    findings += check_cookies(get_set_cookies(resp), is_https)
+    cookies = get_set_cookies(resp)
+    findings += check_cookies(cookies, is_https)
+    findings += check_host_cookie_prefix(cookies, is_https)
+    findings += check_coop(h)
+    findings += check_coep(h)
+    findings += check_corp(h)
     return findings
 
 
@@ -449,3 +545,21 @@ def analyze(url: str, *, session: requests.Session | None = None, timeout: int =
     return HeaderReport(url=url, final_url=resp.url, status=resp.status_code,
                         headers=dict(resp.headers), findings=findings,
                         score=score, grade=grade_for(score), meta_csp=meta_csp)
+
+
+def analyze_paths(base_url: str, paths: list[str], *,
+                  session: requests.Session | None = None,
+                  timeout: int = DEFAULT_TIMEOUT,
+                  cors: bool = True, redirect: bool = True) -> list[HeaderReport]:
+    base_url = normalize_url(base_url)
+    session = session or make_session()
+    reports: list[HeaderReport] = []
+    for path in paths:
+        path = path if path.startswith("/") else "/" + path
+        url = base_url.rstrip("/") + path
+        try:
+            reports.append(analyze(url, session=session, timeout=timeout,
+                                   cors=cors, redirect=redirect))
+        except requests.RequestException:
+            continue
+    return reports

@@ -234,26 +234,63 @@ class Resolver:
 class WildcardSignature:
     ips: set[str] = field(default_factory=set)
     cnames: set[str] = field(default_factory=set)
+    http_fingerprints: set[tuple[int, int]] = field(default_factory=set)
 
     def matches(self, res: Resolution) -> bool:
-        if not self.ips and not self.cnames:
+        if not self.ips and not self.cnames and not self.http_fingerprints:
             return False
         if res.cnames:
             if set(res.cnames) & self.cnames:
                 return True
-        if res.addresses and self.ips:
+        if res.addresses and self.ips and not self.http_fingerprints:
             if set(res.addresses) <= self.ips:
                 return True
         return False
 
+    def maybe_wildcard(self, res: Resolution) -> bool:
+        """True when the IPs match but HTTP confirmation is needed."""
+        if not self.http_fingerprints or not self.ips:
+            return False
+        if res.addresses and set(res.addresses) <= self.ips:
+            return True
+        return False
 
-def detect_wildcard(domain: str, resolver: Resolver, probes: int = 3) -> WildcardSignature:
+    def matches_http(self, status: int, content_length: int) -> bool:
+        if not self.http_fingerprints:
+            return False
+        return (status, content_length) in self.http_fingerprints
+
+
+def _probe_http_fingerprint(host: str, session: requests.Session,
+                            timeout: int = 5) -> tuple[int, int] | None:
+    for scheme in ("https", "http"):
+        try:
+            r = session.get(f"{scheme}://{host}/", timeout=timeout,
+                            allow_redirects=True)
+            return (r.status_code, len(r.content))
+        except requests.RequestException:
+            continue
+    return None
+
+
+def detect_wildcard(domain: str, resolver: Resolver, probes: int = 3,
+                    session: requests.Session | None = None) -> WildcardSignature:
     sig = WildcardSignature()
+    probe_names: list[str] = []
     for _ in range(probes):
         label = "rk-" + secrets.token_hex(8)
-        r = resolver.resolve(f"{label}.{domain}")
+        name = f"{label}.{domain}"
+        r = resolver.resolve(name)
         sig.ips.update(r.addresses)
         sig.cnames.update(r.cnames)
+        if r.alive:
+            probe_names.append(name)
+    if probe_names and not sig.cnames:
+        session = session or make_session()
+        for name in probe_names:
+            fp = _probe_http_fingerprint(name, session)
+            if fp:
+                sig.http_fingerprints.add(fp)
     return sig
 
 
@@ -325,23 +362,37 @@ def enumerate_subdomains(
                 result.add(h, name)
 
     if bruteforce:
-        wc = detect_wildcard(domain, resolver)
+        wc = detect_wildcard(domain, resolver, session=session)
         result.wildcard_ips = wc.ips
         result.wildcard_cnames = wc.cnames
-        if wc.ips or wc.cnames:
+        if wc.ips or wc.cnames or wc.http_fingerprints:
             parts = sorted(wc.ips) + sorted(wc.cnames)
+            if wc.http_fingerprints:
+                parts.append(f"http-fingerprints:{len(wc.http_fingerprints)}")
             log(f"[brute] wildcard DNS detected -> {', '.join(parts)}")
         words = load_wordlist(wordlist)
         candidates = [f"{w}.{domain}" for w in words]
         log(f"[brute] trying {len(candidates)} names with {threads} threads ...")
         resolved = resolve_many(candidates, resolver, threads)
+        maybe_wild: list[tuple[str, Resolution]] = []
         for name, r in resolved.items():
             if not r.alive:
                 continue
             if wc.matches(r):
                 continue
+            if wc.maybe_wildcard(r):
+                maybe_wild.append((name, r))
+                continue
             result.add(name, "bruteforce")
             result.resolved[name] = r
+        if maybe_wild:
+            log(f"[brute] HTTP-confirming {len(maybe_wild)} candidates with CDN IPs ...")
+            for name, r in maybe_wild:
+                fp = _probe_http_fingerprint(name, session)
+                if fp and wc.matches_http(fp[0], fp[1]):
+                    continue
+                result.add(name, "bruteforce")
+                result.resolved[name] = r
 
     if resolve:
         todo = [n for n in result.found if n not in result.resolved]
