@@ -7,13 +7,58 @@ works, not just what it does.
 > Only run these against domains and sites you own or have written permission
 > to test. Brute-forcing DNS and probing CORS send traffic to the target.
 
+## Requirements
+
+- **Python 3.10+** — [download here](https://www.python.org/downloads/) if you don't have it
+  - On Windows, check "Add python.exe to PATH" during installation
+- **requests** — HTTP library
+- **dnspython** — DNS resolution with CNAME and retry support
+- **pytest** — only needed if you want to run the tests
+
 ## Install
 
+**1. Clone the repo:**
+
 ```bash
-pip install -e .            # or: pip install -e '.[test]' to get pytest
+git clone https://github.com/NinjazInk/reconkit.git
+cd reconkit
 ```
 
-Requires Python 3.9+, `requests` and `dnspython`.
+**2. Install dependencies:**
+
+```bash
+pip install requests dnspython
+```
+
+On Windows, if `pip` isn't recognised:
+```bash
+py -m pip install requests dnspython
+```
+
+**3. Install reconkit as a command:**
+
+```bash
+pip install -e .
+```
+
+Or on Windows:
+```bash
+py -m pip install -e .
+```
+
+After this, `reconkit` works as a command from any directory.
+
+**Alternative — run without installing:**
+
+```bash
+python -m reconkit.cli scan example.com
+```
+
+**Verify it works:**
+
+```bash
+reconkit --version
+```
 
 ## Full scan (start here)
 
@@ -82,7 +127,10 @@ How it works:
 
 **Wildcard DNS:** if `*.example.com` resolves, every guess "succeeds". Before
 brute-forcing, reconkit resolves a few random labels; brute-force hits that
-return only those wildcard IPs are discarded.
+return only those wildcard IPs are discarded. For CDN-hosted domains where
+many real subdomains share the same IP pool, reconkit also compares HTTP
+response fingerprints (status code + content length) to tell real sites apart
+from the wildcard default page.
 
 Passive results are then resolved, so you can see which names are still live
 (names in CT logs are often long dead). A CNAME pointing at an unclaimed cloud
@@ -115,8 +163,15 @@ Each finding has a severity, a **why**, and a **fix**. The checks:
 - **X-XSS-Protection**: legacy auditor enabled
 - **Information disclosure**: versioned `Server`, `X-Powered-By`, `X-AspNet-Version`, …
 - **Cookies**: missing `Secure`, `HttpOnly`, `SameSite`; `SameSite=None` without `Secure`
+- **COOP / COEP / CORP**: missing Cross-Origin-Opener-Policy, Cross-Origin-Embedder-Policy, Cross-Origin-Resource-Policy (info-level)
+- **`__Host-` cookie prefix**: validates that `__Host-` cookies have `Secure`, `Path=/`, and no `Domain` attribute
 - **CORS**: sends a request with a foreign `Origin` and flags reflection (high if combined with `Allow-Credentials: true`), `null` origin, or `*` (skip with `--no-cors`)
 - **HTTP to HTTPS redirect**: requests `http://host/` and follows redirects by hand. It flags no redirect, a chain that never reaches HTTPS, extra plain-HTTP hops, and a first hop to a *different* host (the browser then never learns this host's HSTS policy). Skip with `--no-redirect`
+- **TLS certificate errors**: expired, self-signed, or misconfigured certificates are surfaced as high-severity findings
+- **Meta CSP**: parses `<meta http-equiv="Content-Security-Policy">` from the page body when the header is absent (handles both single- and double-quoted attributes)
+- **Dual CSP headers**: detects when the server sends multiple CSP headers (which `requests` comma-joins) and warns about it
+- **Bot/WAF detection**: recognises Cloudflare, Akamai, DDoS-Guard, Sucuri challenge pages and marks them as "BLOCKED" instead of grading meaningless headers
+- **Per-path analysis**: `--paths /,/api,/admin` audits multiple paths, since different endpoints can have different headers
 
 The score starts at 100 and subtracts 25 / 12 / 5 for high / medium / low
 findings, giving a grade from A to F. If the response is HTTP 4xx/5xx the output
@@ -143,7 +198,19 @@ reconkit/
 tests/
 ```
 
-Ideas for extending: more passive sources (e.g. SecurityTrails, VirusTotal with
-API keys), recursive brute-forcing of discovered subdomains, permutation
-generation (`dev-api`, `api2`), TLS certificate checks, and a scope file that
-refuses out-of-scope targets.
+## Global options
+
+| Flag | Description |
+|---|---|
+| `--user-agent "Mozilla/5.0 ..."` | Custom User-Agent header (default: `reconkit/0.1`) |
+| `--version` | Print version and exit |
+
+The default UA is fingerprintable by WAFs. Use `--user-agent` with a common
+browser string if you're getting blocked.
+
+## Ideas for extending
+
+- More passive sources (SecurityTrails, VirusTotal with API keys)
+- Recursive brute-forcing of discovered subdomains
+- Permutation generation (`dev-api`, `api2`)
+- A scope file that refuses out-of-scope targets
