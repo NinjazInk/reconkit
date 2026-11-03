@@ -10,6 +10,7 @@ import requests
 
 from . import __version__
 from .headers import analyze, analyze_paths
+from .http import make_session
 from .scan import scan
 from .subdomains import PASSIVE_SOURCES, enumerate_subdomains
 
@@ -58,12 +59,18 @@ def enum_kwargs(args) -> dict:
 
 # --------------------------------------------------------------------------- #
 
+def _session_from_args(args) -> requests.Session | None:
+    ua = getattr(args, "user_agent", None)
+    return make_session(ua) if ua else None
+
+
 def cmd_subdomains(args) -> int:
     try:
         result = enumerate_subdomains(
             args.domain,
             resolve=not args.no_resolve,
             log=log if not args.quiet else (lambda _m: None),
+            session=_session_from_args(args),
             **enum_kwargs(args),
         )
     except ValueError as exc:
@@ -135,13 +142,15 @@ def _print_report(report, color: bool, verbose: bool) -> None:
 
 def cmd_headers(args) -> int:
     paths = args.paths.split(",") if getattr(args, "paths", None) else None
+    session = _session_from_args(args)
     try:
         if paths:
             reports = analyze_paths(args.url, paths, timeout=args.timeout,
-                                    cors=not args.no_cors, redirect=not args.no_redirect)
+                                    cors=not args.no_cors, redirect=not args.no_redirect,
+                                    session=session)
         else:
             reports = [analyze(args.url, timeout=args.timeout, cors=not args.no_cors,
-                               redirect=not args.no_redirect)]
+                               redirect=not args.no_redirect, session=session)]
     except requests.RequestException as exc:
         log(f"request failed: {exc}")
         return 1
@@ -268,6 +277,8 @@ def build_parser() -> argparse.ArgumentParser:
                     "Only scan targets you own or have permission to test.",
     )
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    p.add_argument("--user-agent", metavar="UA",
+                   help="custom User-Agent header (default: reconkit/0.1)")
     sub = p.add_subparsers(dest="command", required=True, metavar="<command>")
 
     s = sub.add_parser(

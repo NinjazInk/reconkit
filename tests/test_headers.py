@@ -257,3 +257,39 @@ def test_host_prefix_has_domain():
 def test_host_prefix_skipped_on_http():
     cookies = ["__Host-sess=abc; Path=/"]
     assert H.check_host_cookie_prefix(cookies, is_https=False) == []
+
+
+# ---------------- Fix 1: single-quoted meta CSP ----------------
+
+def test_extract_meta_csp_single_quotes():
+    html = "<meta http-equiv='Content-Security-Policy' content='default-src https:'>"
+    assert H.extract_meta_csp(html) == "default-src https:"
+
+
+def test_extract_meta_csp_single_quotes_reversed():
+    html = "<meta content='script-src https:' http-equiv='Content-Security-Policy'>"
+    assert H.extract_meta_csp(html) == "script-src https:"
+
+
+# ---------------- Fix 2: binary response in challenge detection --------
+
+def test_detect_challenge_binary_body():
+    r = make_resp({})
+    r.status_code = 200
+    r._content = b'\x89PNG\r\n\x1a\n' + b'\xff' * 1000
+    r.encoding = None
+    assert H.detect_challenge_page(r) is None
+
+
+# ---------------- Fix 3: check_xfo with meta CSP ----------------
+
+def test_xfo_meta_csp_frame_ancestors():
+    h = CaseInsensitiveDict({})
+    assert H.check_xfo(h, meta_csp="frame-ancestors 'self'") == []
+
+
+def test_xfo_dual_csp_frame_ancestors():
+    h = CaseInsensitiveDict({
+        "Content-Security-Policy": "frame-ancestors 'self', default-src 'none'"
+    })
+    assert H.check_xfo(h) == []

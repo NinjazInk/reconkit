@@ -85,7 +85,10 @@ CHALLENGE_SIGNATURES = [
 
 
 def detect_challenge_page(resp: requests.Response) -> str | None:
-    body = resp.text[:50_000].lower()
+    try:
+        body = resp.text[:50_000].lower()
+    except Exception:
+        body = ""
     for pattern, provider in CHALLENGE_SIGNATURES:
         if re.search(pattern, body, re.I | re.S):
             if resp.status_code in (403, 503):
@@ -100,19 +103,22 @@ def detect_challenge_page(resp: requests.Response) -> str | None:
 
 
 def extract_meta_csp(body: str) -> str | None:
-    m = re.search(
-        r'<meta\s[^>]*http-equiv\s*=\s*"Content-Security-Policy"'
-        r'\s[^>]*content\s*=\s*"([^"]+)"',
-        body, re.I | re.S,
-    )
-    if m:
-        return m.group(1)
-    m = re.search(
-        r'<meta\s[^>]*content\s*=\s*"([^"]+)"'
-        r'\s[^>]*http-equiv\s*=\s*"Content-Security-Policy"',
-        body, re.I | re.S,
-    )
-    return m.group(1) if m else None
+    for q in ('"', "'"):
+        m = re.search(
+            rf'<meta\s[^>]*http-equiv\s*=\s*{q}Content-Security-Policy{q}'
+            rf'\s[^>]*content\s*=\s*{q}([^{q}]+){q}',
+            body, re.I | re.S,
+        )
+        if m:
+            return m.group(1)
+        m = re.search(
+            rf'<meta\s[^>]*content\s*=\s*{q}([^{q}]+){q}'
+            rf'\s[^>]*http-equiv\s*=\s*{q}Content-Security-Policy{q}',
+            body, re.I | re.S,
+        )
+        if m:
+            return m.group(1)
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -250,8 +256,10 @@ def check_csp(h, meta_csp: str | None = None) -> list[Finding]:
     return out
 
 
-def check_xfo(h) -> list[Finding]:
-    csp = parse_csp(h.get("Content-Security-Policy", ""))
+def check_xfo(h, meta_csp: str | None = None) -> list[Finding]:
+    raw_csp = h.get("Content-Security-Policy") or meta_csp or ""
+    policies = split_multi_csp(raw_csp) if raw_csp else []
+    csp = parse_csp(policies[0]) if policies else {}
     v = h.get("X-Frame-Options")
     if not v:
         if "frame-ancestors" in csp:
@@ -505,7 +513,7 @@ def analyze_response(resp: requests.Response, url: str,
     findings: list[Finding] = []
     findings += check_hsts(h, is_https)
     findings += check_csp(h, meta_csp=meta_csp)
-    findings += check_xfo(h)
+    findings += check_xfo(h, meta_csp=meta_csp)
     findings += check_xcto(h)
     findings += check_referrer(h)
     findings += check_permissions_policy(h)
@@ -524,7 +532,28 @@ def analyze(url: str, *, session: requests.Session | None = None, timeout: int =
             cors: bool = True, redirect: bool = True) -> HeaderReport:
     url = normalize_url(url)
     session = session or make_session()
-    resp = session.get(url, timeout=timeout, allow_redirects=True)
+    try:
+        resp = session.get(url, timeout=timeout, allow_redirects=True)
+    except requests.exceptions.SSLError as exc:
+        msg = str(exc)
+        tls_finding = Finding("TLS", "high", "TLS certificate error",
+                              f"The TLS handshake failed: {msg[:200]}. This may indicate an expired, "
+                              "self-signed, or misconfigured certificate.",
+                              "Install a valid certificate from a trusted CA.")
+        try:
+            resp = session.get(url, timeout=timeout, allow_redirects=True, verify=False)
+        except requests.RequestException:
+            return HeaderReport(url=url, final_url=url, status=0,
+                                headers={}, findings=[tls_finding],
+                                score=max(0, 100 - SEVERITY_WEIGHT["high"]),
+                                grade=grade_for(max(0, 100 - SEVERITY_WEIGHT["high"])))
+        findings = analyze_response(resp, url)
+        findings.insert(0, tls_finding)
+        findings.sort(key=lambda f: SEVERITY_ORDER.index(f.severity))
+        score = max(0, 100 - sum(SEVERITY_WEIGHT[f.severity] for f in findings))
+        return HeaderReport(url=url, final_url=resp.url, status=resp.status_code,
+                            headers=dict(resp.headers), findings=findings,
+                            score=score, grade=grade_for(score))
 
     challenge = detect_challenge_page(resp)
     if challenge:

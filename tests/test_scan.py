@@ -166,3 +166,28 @@ def test_scan_orders_and_combines(monkeypatch):
     assert result.takeovers[0].service == "Heroku"
     assert result.hosts[0].report is None  # dangling: no HTTP audit
     assert result.to_dict()["hosts"][1]["grade"] == "F"
+
+
+# ---------------- Fix 6: blocked hosts sort separately ----------------
+
+def test_blocked_hosts_sort_after_real_grades(monkeypatch):
+    fake = S.SubdomainResult("example.com")
+    for n in ("ok.example.com", "blocked.example.com", "bad.example.com"):
+        fake.add(n, "crtsh")
+    fake.resolved = {
+        "ok.example.com": S.Resolution("ok.example.com", ["1.1.1.1"]),
+        "blocked.example.com": S.Resolution("blocked.example.com", ["2.2.2.2"]),
+        "bad.example.com": S.Resolution("bad.example.com", ["3.3.3.3"]),
+    }
+    monkeypatch.setattr(SC, "enumerate_subdomains", lambda *a, **kw: fake)
+
+    def fake_analyze(url, **kw):
+        if "blocked" in url:
+            return H.HeaderReport(url, url, 403, {}, [], 0, "!", blocked_by="Cloudflare")
+        score = 95 if "ok" in url else 20
+        return H.HeaderReport(url, url, 200, {}, [], score, H.grade_for(score), blocked_by=None)
+    monkeypatch.setattr(SC, "analyze", fake_analyze)
+
+    result = SC.scan("example.com", http_threads=2, check_takeover=False)
+    names = [h.name for h in result.hosts]
+    assert names.index("bad.example.com") < names.index("blocked.example.com")

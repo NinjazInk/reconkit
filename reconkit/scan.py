@@ -101,8 +101,8 @@ def audit_host(res: Resolution, *, timeout: int, cors: bool,
 
 
 def sort_key(h: HostResult):
-    # Takeovers first, then worst grade, then hosts that didn't answer.
-    return (h.takeover is None, h.report is None, h.report.score if h.report else 0, h.name)
+    blocked = h.report is not None and h.report.blocked_by is not None
+    return (h.takeover is None, blocked, h.report is None, h.report.score if h.report else 0, h.name)
 
 
 def scan(

@@ -233,3 +233,31 @@ def test_cdn_wildcard_http_filtering(tmp_path, monkeypatch):
     )
     assert "www.example.com" in r.found
     assert "ghost.example.com" not in r.found
+
+
+# ---------------- Fix 4: DNS timeout recorded ----------------
+
+def test_resolver_records_timeout(monkeypatch):
+    import dns.exception
+    r = S.Resolver()
+
+    def fake_resolve(name, rtype):
+        raise dns.exception.Timeout("timed out")
+
+    monkeypatch.setattr(r._r, "resolve", fake_resolve)
+    res = r.resolve("slow.example.com")
+    assert res.error is not None
+    assert "timeout" in res.error.lower()
+
+
+# ---------------- Fix 5: fingerprint tolerance ----------------
+
+def test_wildcard_http_fingerprint_tolerance():
+    sig = S.WildcardSignature(
+        ips={"10.0.0.1"},
+        http_fingerprints={(200, 1000)},
+    )
+    assert sig.matches_http(200, 1000)
+    assert sig.matches_http(200, 1040)
+    assert not sig.matches_http(200, 1200)
+    assert not sig.matches_http(404, 1000)

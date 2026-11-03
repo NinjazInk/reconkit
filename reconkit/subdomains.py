@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import re
 import secrets
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from importlib import resources
@@ -187,6 +188,8 @@ class Resolver:
                 return self._r.resolve(name, rtype)
             except dns.resolver.NoNameservers as exc:
                 last_exc = exc
+                if attempt < self.SERVFAIL_RETRIES:
+                    time.sleep(0.5 * (attempt + 1))
         raise last_exc
 
     def resolve(self, name: str) -> Resolution:
@@ -207,7 +210,10 @@ class Resolver:
             except dns.resolver.NoNameservers:
                 res.error = "SERVFAIL (server failure) after retries"
                 return res
-            except (dns.resolver.NoAnswer, dns.exception.Timeout):
+            except dns.exception.Timeout:
+                res.error = res.error or "DNS timeout"
+                continue
+            except dns.resolver.NoAnswer:
                 continue
             for rrset in answer.response.answer:
                 for rdata in rrset:
@@ -255,10 +261,18 @@ class WildcardSignature:
             return True
         return False
 
-    def matches_http(self, status: int, content_length: int) -> bool:
+    def matches_http(self, status: int, content_length: int,
+                     tolerance: float = 0.05) -> bool:
         if not self.http_fingerprints:
             return False
-        return (status, content_length) in self.http_fingerprints
+        for fp_status, fp_len in self.http_fingerprints:
+            if status != fp_status:
+                continue
+            if fp_len == 0 and content_length == 0:
+                return True
+            if fp_len > 0 and abs(content_length - fp_len) / fp_len <= tolerance:
+                return True
+        return False
 
 
 def _probe_http_fingerprint(host: str, session: requests.Session,
@@ -316,7 +330,11 @@ def resolve_many(names: Iterable[str], resolver: Resolver, threads: int,
     with ThreadPoolExecutor(max_workers=threads) as pool:
         futures = {pool.submit(resolver.resolve, n): n for n in names}
         for fut in as_completed(futures):
-            r = fut.result()
+            name = futures[fut]
+            try:
+                r = fut.result()
+            except Exception as exc:
+                r = Resolution(name, error=f"{type(exc).__name__}: {exc}")
             out[r.name] = r
             if on_result:
                 on_result(r)
