@@ -7,58 +7,177 @@ works, not just what it does.
 > Only run these against domains and sites you own or have written permission
 > to test. Brute-forcing DNS and probing CORS send traffic to the target.
 
-## Requirements
+## Installation (step by step)
 
-- **Python 3.10+** — [download here](https://www.python.org/downloads/) if you don't have it
-  - On Windows, check "Add python.exe to PATH" during installation
-- **requests** — HTTP library
-- **dnspython** — DNS resolution with CNAME and retry support
-- **pytest** — only needed if you want to run the tests
+### Step 1: Install Python
 
-## Install
+reconkit requires **Python 3.10 or newer**.
 
-**1. Clone the repo:**
+**Check if you already have it** — open a terminal (Command Prompt on Windows,
+Terminal on Mac/Linux) and run:
 
-```bash
+```
+python --version
+```
+
+If that says "not recognized" or shows a version below 3.10, install Python:
+
+- **Windows**: Download from https://www.python.org/downloads/
+  - **IMPORTANT**: On the first installer screen, check the box that says
+    **"Add python.exe to PATH"** before clicking Install. If you miss this,
+    nothing else will work from the command prompt.
+  - After installing, **close and reopen** your Command Prompt so the PATH
+    change takes effect.
+- **Mac**: `brew install python` (if you have Homebrew), or download from
+  https://www.python.org/downloads/
+- **Linux**: `sudo apt install python3 python3-pip` (Debian/Ubuntu) or
+  `sudo dnf install python3 python3-pip` (Fedora)
+
+**Verify Python is working:**
+
+```
+python --version
+```
+
+You should see something like `Python 3.12.4`. If Windows still doesn't
+recognise `python`, try `py --version` instead — and use `py` wherever this
+guide says `python`.
+
+### Step 2: Install Git (if you don't have it)
+
+```
+git --version
+```
+
+If that says "not recognized":
+
+- **Windows**: Download from https://git-scm.com/download/win — use the
+  default options. Close and reopen Command Prompt after installing.
+- **Mac**: Run `xcode-select --install` or `brew install git`
+- **Linux**: `sudo apt install git` or `sudo dnf install git`
+
+### Step 3: Download reconkit
+
+Pick a folder where you want the tool to live. For example, to put it in a
+folder called `cytools` on your desktop:
+
+**Windows:**
+```
+mkdir %USERPROFILE%\Desktop\cytools
+```
+```
+cd %USERPROFILE%\Desktop\cytools
+```
+```
 git clone https://github.com/NinjazInk/reconkit.git
+```
+```
 cd reconkit
 ```
 
-**2. Install dependencies:**
-
-```bash
-pip install requests dnspython
+**Mac / Linux:**
+```
+mkdir -p ~/Desktop/cytools
+```
+```
+cd ~/Desktop/cytools
+```
+```
+git clone https://github.com/NinjazInk/reconkit.git
+```
+```
+cd reconkit
 ```
 
-On Windows, if `pip` isn't recognised:
-```bash
+You should now be inside the `reconkit` folder. Verify with:
+
+```
+dir
+```
+
+(or `ls` on Mac/Linux). You should see files like `pyproject.toml`,
+`README.md`, and a `reconkit/` folder.
+
+### Step 4: Install dependencies
+
+reconkit needs two Python libraries:
+
+| Library | What it does |
+|---|---|
+| **requests** | Makes HTTP requests to web servers |
+| **dnspython** | DNS lookups with CNAME and retry support |
+
+Install them:
+
+```
+python -m pip install requests dnspython
+```
+
+If you see a "pip not found" error, try:
+```
 py -m pip install requests dnspython
 ```
 
-**3. Install reconkit as a command:**
+### Step 5: Install reconkit
 
-```bash
-pip install -e .
+Still inside the `reconkit` folder, run:
+
+```
+python -m pip install -e .
 ```
 
-Or on Windows:
-```bash
-py -m pip install -e .
+The `-e` means "editable" — Python links to the files in this folder rather
+than copying them, so any updates you pull with `git pull` take effect
+immediately.
+
+### Step 6: Verify it works
+
+**Option A** — if `pip install -e .` succeeded without errors:
+
 ```
-
-After this, `reconkit` works as a command from any directory.
-
-**Alternative — run without installing:**
-
-```bash
-python -m reconkit.cli scan example.com
-```
-
-**Verify it works:**
-
-```bash
 reconkit --version
 ```
+
+Should print `reconkit 0.1.0`.
+
+**Option B** — if `reconkit` is "not recognized" (Windows PATH issue), run it
+through Python instead. This always works:
+
+```
+python -m reconkit.cli --version
+```
+
+If Option A doesn't work but Option B does, use `python -m reconkit.cli`
+everywhere this guide says `reconkit`. This is a Windows PATH issue — the
+`reconkit.exe` command was installed to a Scripts folder that isn't in your
+PATH. It doesn't affect functionality.
+
+### Quick test
+
+Run a header check against a public site you own or have permission to test:
+
+```
+reconkit headers https://example.com
+```
+
+Or via Python:
+
+```
+python -m reconkit.cli headers https://example.com
+```
+
+You should see a grade (A-F), a score, and a list of findings.
+
+### Troubleshooting
+
+| Problem | Fix |
+|---|---|
+| `python` not recognized | Close and reopen Command Prompt. If still broken, reinstall Python with "Add to PATH" checked. |
+| `pip` not found | Use `python -m pip` instead of `pip`. |
+| `reconkit` not recognized | Use `python -m reconkit.cli` instead. |
+| `git` not recognized | Install Git (Step 2) and reopen Command Prompt. |
+| `ModuleNotFoundError: requests` | Run Step 4 again — dependencies didn't install. |
+| Permission denied (Mac/Linux) | Add `--user` to pip commands: `python -m pip install --user -e .` |
 
 ## Full scan (start here)
 
