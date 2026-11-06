@@ -16,6 +16,22 @@ from .subdomains import PASSIVE_SOURCES, enumerate_subdomains
 
 COLORS = {"high": "31", "medium": "33", "low": "36", "info": "37", "ok": "32", "dim": "90"}
 
+BANNER = """
+    ____  ________________  _   ____ __ ________
+   / __ \\/ ____/ ____/ __ \\/ | / / //_//  _/_  /
+  / /_/ / __/ / /   / / / /  |/ / ,<   / /  / /
+ / _, _/ /___/ /___/ /_/ / /|  / /| |_/ / / /__
+/_/ |_/_____/\\____/\\____/_/ |_/_/ |_/___/ /____/
+          reconnaissance toolkit v{ver}
+"""
+
+
+def print_banner() -> None:
+    if not sys.stderr.isatty() or os.environ.get("NO_COLOR"):
+        return
+    text = BANNER.replace("{ver}", __version__)
+    print(f"\033[36m{text}\033[0m", file=sys.stderr)
+
 
 def _use_color(stream) -> bool:
     return stream.isatty() and not os.environ.get("NO_COLOR")
@@ -347,6 +363,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if not getattr(args, "json", False) and not getattr(args, "quiet", False):
+        print_banner()
     try:
         return args.func(args)
     except KeyboardInterrupt:
